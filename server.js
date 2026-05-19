@@ -4,23 +4,24 @@ const expressWs = require('express-ws');
 const app = express();
 expressWs(app);
 app.use(express.json());
+app.use(express.raw({ type: 'application/octet-stream', limit: '5mb' }));
 
 let esp32ws = null;
 let camClients = [];
-let appClients = [];
+let eventClients = [];
 let pendingCapture = null;
 let nextBinaryIsCapture = false;
 
 // ═══════════════════════════════════════════
-//  ESP32-CAM WebSocket (Le Tunnel de la Caméra)
+//  ESP32-CAM WebSocket
 // ═══════════════════════════════════════════
 app.ws('/cam', (ws) => {
   esp32ws = ws;
-  console.log('📸 ESP32-CAM connecté au Relay');
+  console.log('ESP32-CAM connecté');
 
   ws.on('message', (data) => {
     if (typeof data === 'string') {
-      // Message texte = réponse de l'ESP32
+      console.log('CAM msg:', data);
       if (data === 'CAPTURE_START') {
         nextBinaryIsCapture = true;
       } else if (data === 'CAPTURE_ERROR' && pendingCapture) {
@@ -29,21 +30,12 @@ app.ws('/cam', (ws) => {
         nextBinaryIsCapture = false;
       }
     } else {
-      // Données binaires reçues
-      if (nextBinaryIsCapture) {
+      if (nextBinaryIsCapture && pendingCapture) {
         nextBinaryIsCapture = false;
-        
-        if (pendingCapture) {
-          // Cas 1 : Capture demandée manuellement via l'interface web (/relay/capture)
-          pendingCapture.resolve(data);
-          pendingCapture = null;
-        } else {
-          // Cas 2 : 🛠️ Capture automatique (déclenchée par le WROOM)
-          // La photo n'est pas renvoyée ici, la CAM gère son email et sa carte SD !
-          console.log("✅ Photo automatique reçue et gérée par l'ESP32-CAM");
-        }
+        pendingCapture.resolve(data);
+        pendingCapture = null;
       } else {
-        // Frame du stream normal (MJPEG)
+        // Redistribue aux clients MJPEG
         camClients.forEach((res) => {
           try {
             res.write('--frame\r\n');
@@ -57,77 +49,79 @@ app.ws('/cam', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log('❌ ESP32-CAM déconnecté');
+    console.log('ESP32-CAM déconnecté');
     esp32ws = null;
     if (pendingCapture) {
       pendingCapture.reject(new Error('ESP32 déconnecté'));
       pendingCapture = null;
     }
   });
-});
 
-// ═══════════════════════════════════════════
-//  App WebSocket (alertes pour ton App mobile/web)
-// ═══════════════════════════════════════════
-app.ws('/events', (ws) => {
-  appClients.push(ws);
-  ws.on('close', () => {
-    appClients = appClients.filter((c) => c !== ws);
+  ws.on('error', (err) => {
+    console.error('Erreur WebSocket CAM:', err.message);
   });
 });
 
 // ═══════════════════════════════════════════
-//  Stream MJPEG local
+//  App WebSocket — alertes temps réel
+// ═══════════════════════════════════════════
+app.ws('/events', (ws) => {
+  eventClients.push(ws);
+  console.log('App connectée aux events');
+
+  ws.on('close', () => {
+    eventClients = eventClients.filter((c) => c !== ws);
+  });
+});
+
+// ═══════════════════════════════════════════
+//  Stream MJPEG
 // ═══════════════════════════════════════════
 app.get('/stream', (req, res) => {
   res.setHeader('Content-Type', 'multipart/x-mixed-replace; boundary=frame');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Access-Control-Allow-Origin', '*');
   camClients.push(res);
+  console.log('Client stream connecté — total:', camClients.length);
+
   req.on('close', () => {
     camClients = camClients.filter((c) => c !== res);
+    console.log('Client stream déconnecté — total:', camClients.length);
   });
 });
 
 // ═══════════════════════════════════════════
-//  Alertes PIR (La passerelle magique du WROOM) 🌉
+//  Alerte PIR — reçue du WROOM
 // ═══════════════════════════════════════════
 app.post('/motion', (req, res) => {
-  console.log('🚨 Mouvement détecté par le WROOM !');
-  
-  // 1. On notifie les apps/interfaces web connectées
-  const event = JSON.stringify({ type: 'motion', timestamp: Date.now() });
-  appClients.forEach((ws) => {
+  console.log('Mouvement reçu du WROOM');
+  const event = JSON.stringify({
+    type: 'motion',
+    timestamp: Date.now(),
+  });
+  eventClients.forEach((ws) => {
     if (ws.readyState === 1) ws.send(event);
   });
-
-  // 2. LE PONT : On envoie l'ordre de capture directement dans le tunnel de la CAM
-  if (esp32ws && esp32ws.readyState === 1) { // 1 = OPEN
-    console.log("📤 Envoi de l'ordre CAPTURE à l'ESP32-CAM...");
-    esp32ws.send('CAPTURE');
-  } else {
-    console.log("⚠️ Impossible de déclencher la caméra : ESP32-CAM hors ligne.");
-  }
-
   res.sendStatus(200);
 });
 
 // ═══════════════════════════════════════════
-//  RELAY STATUS — connexion sans IP
+//  Status relay
 // ═══════════════════════════════════════════
 app.get('/relay/status', (req, res) => {
   res.json({
     connected: esp32ws !== null,
-    clients: camClients.length,
+    streamClients: camClients.length,
+    eventClients: eventClients.length,
   });
 });
 
 // ═══════════════════════════════════════════
-//  RELAY CAPTURE — photo sans IP (Requête Manuelle)
+//  Capture photo — demandée par l'app
 // ═══════════════════════════════════════════
 app.get('/relay/capture', (req, res) => {
   if (!esp32ws) {
-    return res.status(503).json({ error: 'ESP32 non connecté au relay' });
+    return res.status(503).json({ error: 'ESP32 non connecté' });
   }
   if (pendingCapture) {
     return res.status(429).json({ error: 'Capture déjà en cours' });
@@ -139,7 +133,7 @@ app.get('/relay/capture', (req, res) => {
       nextBinaryIsCapture = false;
       res.status(504).json({ error: 'Timeout capture' });
     }
-  }, 10000);
+  }, 15000);
 
   pendingCapture = {
     resolve: (data) => {
@@ -150,7 +144,9 @@ app.get('/relay/capture', (req, res) => {
     },
     reject: (err) => {
       clearTimeout(timeout);
-      res.status(500).json({ error: err.message });
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+      }
     },
   };
 
@@ -158,7 +154,7 @@ app.get('/relay/capture', (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-//  RELAY CONTROL — flash/qualité/résolution sans IP
+//  Contrôle caméra — flash, qualité, résolution
 // ═══════════════════════════════════════════
 app.get('/relay/control', (req, res) => {
   if (!esp32ws) {
@@ -166,9 +162,9 @@ app.get('/relay/control', (req, res) => {
   }
   const { var: varName, val } = req.query;
   if (!varName || val === undefined) {
-    return res.status(400).json({ error: 'Paramètres manquants' });
+    return res.status(400).json({ error: 'Params manquants' });
   }
-  esp32ws.send(JSON.stringify({ cmd: 'control', var: varName, val: parseInt(val) }));
+  esp32ws.send(JSON.stringify({ var: varName, val: parseInt(val) }));
   res.json({ ok: true });
 });
 
@@ -178,4 +174,6 @@ app.get('/relay/control', (req, res) => {
 app.get('/ping', (req, res) => res.send('ok'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('🚀 Relay Sentinelle actif sur port ' + PORT));
+app.listen(PORT, () => {
+  console.log('Relay Spectra Vision actif sur port ' + PORT);
+});
