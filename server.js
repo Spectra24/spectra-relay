@@ -12,11 +12,11 @@ let pendingCapture = null;
 let nextBinaryIsCapture = false;
 
 // ═══════════════════════════════════════════
-//  ESP32-CAM WebSocket
+//  ESP32-CAM WebSocket (Le Tunnel de la Caméra)
 // ═══════════════════════════════════════════
 app.ws('/cam', (ws) => {
   esp32ws = ws;
-  console.log('ESP32-CAM connecté');
+  console.log('📸 ESP32-CAM connecté au Relay');
 
   ws.on('message', (data) => {
     if (typeof data === 'string') {
@@ -29,14 +29,21 @@ app.ws('/cam', (ws) => {
         nextBinaryIsCapture = false;
       }
     } else {
-      // Données binaires
-      if (nextBinaryIsCapture && pendingCapture) {
-        // C'est une photo capturée
+      // Données binaires reçues
+      if (nextBinaryIsCapture) {
         nextBinaryIsCapture = false;
-        pendingCapture.resolve(data);
-        pendingCapture = null;
+        
+        if (pendingCapture) {
+          // Cas 1 : Capture demandée manuellement via l'interface web (/relay/capture)
+          pendingCapture.resolve(data);
+          pendingCapture = null;
+        } else {
+          // Cas 2 : 🛠️ Capture automatique (déclenchée par le WROOM)
+          // La photo n'est pas renvoyée ici, la CAM gère son email et sa carte SD !
+          console.log("✅ Photo automatique reçue et gérée par l'ESP32-CAM");
+        }
       } else {
-        // Frame du stream normal
+        // Frame du stream normal (MJPEG)
         camClients.forEach((res) => {
           try {
             res.write('--frame\r\n');
@@ -50,7 +57,7 @@ app.ws('/cam', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log('ESP32-CAM déconnecté');
+    console.log('❌ ESP32-CAM déconnecté');
     esp32ws = null;
     if (pendingCapture) {
       pendingCapture.reject(new Error('ESP32 déconnecté'));
@@ -60,7 +67,7 @@ app.ws('/cam', (ws) => {
 });
 
 // ═══════════════════════════════════════════
-//  App WebSocket (alertes PIR)
+//  App WebSocket (alertes pour ton App mobile/web)
 // ═══════════════════════════════════════════
 app.ws('/events', (ws) => {
   appClients.push(ws);
@@ -83,14 +90,25 @@ app.get('/stream', (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-//  Alertes PIR (WROOM-32)
+//  Alertes PIR (La passerelle magique du WROOM) 🌉
 // ═══════════════════════════════════════════
 app.post('/motion', (req, res) => {
-  console.log('Mouvement détecté !');
+  console.log('🚨 Mouvement détecté par le WROOM !');
+  
+  // 1. On notifie les apps/interfaces web connectées
   const event = JSON.stringify({ type: 'motion', timestamp: Date.now() });
   appClients.forEach((ws) => {
     if (ws.readyState === 1) ws.send(event);
   });
+
+  // 2. LE PONT : On envoie l'ordre de capture directement dans le tunnel de la CAM
+  if (esp32ws && esp32ws.readyState === 1) { // 1 = OPEN
+    console.log("📤 Envoi de l'ordre CAPTURE à l'ESP32-CAM...");
+    esp32ws.send('CAPTURE');
+  } else {
+    console.log("⚠️ Impossible de déclencher la caméra : ESP32-CAM hors ligne.");
+  }
+
   res.sendStatus(200);
 });
 
@@ -105,7 +123,7 @@ app.get('/relay/status', (req, res) => {
 });
 
 // ═══════════════════════════════════════════
-//  RELAY CAPTURE — photo sans IP
+//  RELAY CAPTURE — photo sans IP (Requête Manuelle)
 // ═══════════════════════════════════════════
 app.get('/relay/capture', (req, res) => {
   if (!esp32ws) {
@@ -160,4 +178,4 @@ app.get('/relay/control', (req, res) => {
 app.get('/ping', (req, res) => res.send('ok'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Relay actif sur port ' + PORT));
+app.listen(PORT, () => console.log('🚀 Relay Sentinelle actif sur port ' + PORT));
